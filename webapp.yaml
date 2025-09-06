@@ -1,0 +1,124 @@
+---
+# Deployment основной манифест для приложения
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: webapp
+  labels:
+    app: webapp
+spec:
+  replicas: 2  # HPA будет масштабировать до 4
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1  # всегда оставляем хотя бы 1 под работающим
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: webapp
+  template:
+    metadata:
+      labels:
+        app: webapp
+    spec:
+      # распределяем поды по разным зонам для отказоустойчивости
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - webapp
+              topologyKey: topology.kubernetes.io/zone
+      containers:
+      - name: webapp
+        image: your-app:latest
+        ports:
+        - containerPort: 8080
+        # ресурсы с учетом пикового потребления CPU в начале
+        resources:
+          requests:
+            cpu: 100m      # базовое потребление 0.1 CPU
+            memory: 128Mi  # стабильное потребление памяти
+          limits:
+            cpu: 500m      # запас для инициализации и пиков
+            memory: 256Mi  # запас по памяти
+        # проверки готовности - учитываем 5-10 сек инициализации
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10  # ждем инициализацию
+          periodSeconds: 5
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 15  # даем больше времени на старт
+          periodSeconds: 10
+          failureThreshold: 3
+
+---
+# service для доступа к приложению
+apiVersion: v1
+kind: Service
+metadata:
+  name: webapp-service
+spec:
+  selector:
+    app: webapp
+  ports:
+  - port: 80
+    targetPort: 8080
+  type: ClusterIP
+
+---
+# HPA автомасштабирование по нагрузке
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: webapp-hpa  
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: webapp
+  minReplicas: 1 # ночью работает тока один под
+  maxReplicas: 4 # максимум 4 пода при нагрузке
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        targetAverageUtilization: 70  # масштабируем при 70 поц CPU
+  # настройка скорости маштабирования 
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # увеличение под нагрузкой
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+    scaleDown:
+      stabilizationWindowSeconds: 300   # медленно уменьшаем (избегаем флаппинга)
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+
+---
+# PodDisruptionBudget - чтобы поды одновремено не удалялись 
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: webapp-pdb
+spec:
+  minAvailable: 1  # всегда есть 1 под
+  selector:
+    matchLabels:
+      app: webapp
